@@ -12,11 +12,17 @@ from flask import Flask, render_template, request, jsonify
 # Challenge 02: TODO - Import Microsoft Agent Framework
 # HINT: from agent_framework.openai import ???
 # HINT: from agent_framework import ???
+from agent_framework.openai import OpenAIChatClient
+
 
 # Challenge 03: TODO - Import OpenTelemetry instrumentation
 # HINT: from agent_framework.observability import ???
 # HINT: from opentelemetry.sdk.resources import ???
 # HINT: from opentelemetry.semconv._incubating.attributes.service_attributes import ???
+from agent_framework.observability import configure_otel_providers
+from opentelemetry import trace, metrics
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.semconv._incubating.attributes.service_attributes import SERVICE_NAME
 
 
 # Challenge 04: TODO - Import OTLP Exporters for New Relic
@@ -25,9 +31,15 @@ from flask import Flask, render_template, request, jsonify
 # HINT: from opentelemetry.exporter.otlp.proto.grpc._log_exporter import ???
 # HINT: from opentelemetry.sdk._logs import ???
 
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+from opentelemetry.sdk._logs import LoggerProvider
+
 
 # Challenge 06: TODO - Import for AI Monitoring
 # HINT: from opentelemetry._logs import ???
+from opentelemetry._logs import get_logger
 
 
 # Challenge 08: TODO - Import for Security Detection
@@ -43,7 +55,8 @@ load_dotenv()
 # ============================================================================
 # Step 1: Create a resource identifying your service
 # HINT: resource = Resource.create({ ??? })
-
+service_name= os.getenv("OTEL_SERVICE_NAME")
+resource = Resource.create({SERVICE_NAME: service_name})
 #
 # Step 3: Setup observability with the resource
 # HINT: https://learn.microsoft.com/en-us/agent-framework/user-guide/observability?pivots=programming-language-python#1-standard-opentelemetry-environment-variables-recommended
@@ -51,11 +64,13 @@ load_dotenv()
 #
 # Challenge 04: TODO - Update to use OTLP exporters for New Relic
 # HINT: configure_otel_providers(exporters=[???])
+configure_otel_providers()
 
-#
 # Challenge 03: TODO - Step 3: Get tracer and meter instances
 # HINT: tracer = ???
+tracer = trace.get_tracer("agent_framework.web_app")
 # HINT: meter = ???
+meter = metrics.get_meter("agent_framework.web_app")
 # ============================================================================
 
 # 📝 Configure Logging
@@ -70,11 +85,29 @@ logger.propagate = True
 # HINT: request_counter = meter.create_counter(name="???\", description="???\", unit="???")
 # HINT: error_counter = meter.create_counter(???)
 # HINT: tool_call_counter = meter.create_counter(???)
-
+request_counter = meter.create_counter(
+    name="travel.requests",
+    description="Total number of travel planning requests",
+    unit="1",
+)
+error_counter = meter.create_counter(
+    name="travel.errors",
+    description="Total number of travel planning errors",
+    unit="1",
+)
+tool_call_counter = meter.create_counter(
+    name="travel.tool_calls",
+    description="Total number of tool function calls",
+    unit="1",
+)
 #
 # Challenge 06: TODO - Add evaluation metrics
 # HINT: evaluation_passed_counter = meter.create_counter(???)
-
+evaluation_passed_counter = meter.create_counter(
+    name="travel.evaluation.passed",
+    description="Number of travel plan evaluations that passed",
+    unit="1",
+)
 #
 # Challenge 08: TODO - Add security metrics
 # HINT: security_detected_counter = meter.create_counter(???)
@@ -106,20 +139,29 @@ def get_random_destination() -> str:
     """
 
     # Simulate network latency with a small random sleep
-    delay_seconds = uniform(0, 0.99)
-    time.sleep(delay_seconds)
+    with tracer.start_as_current_span("tool.get_random_destination") as span:
+        delay_seconds = uniform(0, 0.99)
+        time.sleep(delay_seconds)
+    
 
-    destinations = ["Garmisch-Partenkirchen", "Munich",
-                    "Paris", "New York", "Tokyo", "Sydney", "Cairo"]
-    destination = destinations[randint(0, len(destinations) - 1)]
+        destinations = ["Garmisch-Partenkirchen", "Munich",
+                        "Paris", "New York", "Tokyo", "Sydney", "Cairo"]
+        destination = destinations[randint(0, len(destinations) - 1)]
+
+        span.set_attribute("tool.name", "get_random_destination")
+        span.set_attribute("travel.destination", destination)
+        span.set_attribute("tool.delay_seconds", delay_seconds)
+
+
     logger.info(f"Selected random destination: {destination}")
 
     # Challenge 05: TODO - Increment request counter
     # HINT: request_counter.add(???)
+    request_counter.add(1, {"tool.name": "get_random_destination"})
 
     # Challenge 05: TODO - Increment tool call counter
     # HINT: tool_call_counter.add(???)
-
+    tool_call_counter.add(1, {"tool.name": "get_random_destination"})
     return f"You have selected {destination} as your travel destination."
 
 
@@ -138,10 +180,13 @@ def get_weather(location: str) -> str:
     Returns:
         Weather description string
     """
-
     # Simulate network latency with a small random float sleep
-    delay_seconds = uniform(0.3, 3.7)
-    time.sleep(delay_seconds)
+    with tracer.start_as_current_span("tool.get_weather") as span:
+        delay_seconds = uniform(0.3, 3.7)
+        time.sleep(delay_seconds)
+        span.set_attribute("tool.name", "get_weather")
+        span.set_attribute("tool.delay_seconds", delay_seconds)
+
 
     # fail every now and then to simulate real-world API unreliability
     if randint(1, 10) > 7:
@@ -152,8 +197,9 @@ def get_weather(location: str) -> str:
 
     # Challenge 05: TODO - Increment tool call counter
     # HINT: tool_call_counter.add(???)
+    tool_call_counter.add(1, {"tool.name": "get_weather"})
 
-    pass  # Your code here
+    return f"The current weather in {location} is sunny with a high of 25°C and a low of 15°C."
 
 
 def get_datetime() -> str:
@@ -170,8 +216,12 @@ def get_datetime() -> str:
     """
 
     # Simulate network latency with a small random float sleep
-    delay_seconds = uniform(0.10, 5.0)
-    time.sleep(delay_seconds)
+    with tracer.start_as_current_span("tool.get_datetime") as span:
+        delay_seconds = uniform(0.10, 5.0)
+        time.sleep(delay_seconds)
+        span.set_attribute("tool.name", "get_datetime")
+        span.set_attribute("tool.delay_seconds", delay_seconds)
+
 
     logger.info("Fetching current date and time.")
 
@@ -187,13 +237,21 @@ model_id = os.environ.get("MODEL_ID", "gpt-5-mini")
 # Challenge 02: TODO - Create the OpenAI Chat Client
 # ============================================================================
 # HINT: use `OpenAIChatClient` with appropriate parameters, i.e. base_url, api_key, model_id
+base_url = os.getenv("MSFT_FOUNDRY_ENDPOINT")
+api_key = os.getenv("MSFT_FOUNDRY_API_KEY")
+model_id = os.getenv("MODEL_ID")
+
+openai_chat_client = OpenAIChatClient(base_url=base_url, api_key=api_key, model_id=model_id)
 
 
 # ============================================================================
 # Challenge 02: TODO - Create the Travel Planning Agent
 # ============================================================================
 # HINT: use `openai_chat_client.as_agent(...)` with appropriate parameters, i.e. chat_client, instructions, tools
-
+agent = openai_chat_client.as_agent(
+    instructions="You are a helpful travel planning assistant. Use the provided tools to gather information and create a personalized travel itinerary based on the user's preferences and requests.",
+    tools=[get_datetime,get_random_destination,get_weather
+    ])
 
 # ============================================================================
 # Challenge 08: TODO - Harden System Prompt Against Prompt Injection
@@ -211,6 +269,7 @@ model_id = os.environ.get("MODEL_ID", "gpt-5-mini")
 #     return ???
 #
 # ============================================================================
+
 
 # ============================================================================
 # Flask Routes
@@ -238,7 +297,7 @@ async def plan_trip():
 
     # Challenge 05: TODO - Start timing the request
     # HINT: start_time = ???
-
+    start_time = time.time()
     # Challenge 03: TODO - Create span for the entire request
     # HINT: with tracer.start_as_current_span(???) as span:
 
@@ -251,6 +310,11 @@ async def plan_trip():
 
         # Challenge 03: TODO - Set span attributes for request parameters
         # HINT: span.set_attribute(???, ???)
+        with tracer.start_as_current_span("web_app.plan_trip") as span:
+            span.set_attribute("request.date", date)
+            span.set_attribute("request.duration", duration)
+            span.set_attribute("request.interests", interests)
+            span.set_attribute("request.special_requests", special_requests)
 
         # ====================================================================
         # Challenge 08: TODO - Security Detection (BEFORE agent execution)
@@ -292,31 +356,55 @@ async def plan_trip():
         # })
         # ====================================================================
 
+        logger.info("LlmChatCompletionMessage", extra={
+            "newrelic.event.type": "LlmChatCompletionMessage",
+            "role": "user",
+            "content": user_prompt,
+            "sequence": 0,
+        })
+
         # Challenge 03: TODO - Create span for agent execution
         # HINT: with tracer.start_as_current_span(???) as agent_span:
+        with tracer.start_as_current_span("web_app.agent_execution") as agent_span:
+            agent_span.set_attribute("agent.model_id", model_id)
+            agent_span.set_attribute("agent.operation", "run")
+            agent_span.set_attribute("agent.prompt.length", len(user_prompt))
 
+            
         # Challenge 02: TODO - Run the agent asynchronously
         # HINT: response = await agent.run(???)
-
+        response = await agent.run(user_prompt)
         # Challenge 02: TODO - Extract the travel plan from response
         # HINT: text_content = response.messages[???].contents[???].text
-
+        text_content = response.messages[-1].contents[0].text
+        # text_content = response.messages[-1].contents[0].text
         # Challenge 03: TODO - Add response attributes to span
         # HINT: agent_span.set_attribute(???, ???)
-
+        agent_span.set_attribute("agent.response.messages", len(response.messages))
+        agent_span.set_attribute("agent.response.length", len(text_content or ""))
         # ====================================================================
         # Challenge 06: TODO - Emit AI Monitoring Events (Assistant + Summary)
         # ====================================================================
         # HINT: logger.info(???, extra={"newrelic.event.type": "LlmChatCompletionMessage", ...})
         # HINT: logger.info(???, extra={"newrelic.event.type": "LlmChatCompletionSummary", ...})
         # ====================================================================
-
+        logger.info("LlmChatCompletionMessage", extra={
+            "newrelic.event.type": "LlmChatCompletionMessage",
+            "role": "assistant",
+            "content": text_content[:100],
+            "sequence": 1,
+        })
         # ====================================================================
         # Challenge 06: TODO - Run Evaluation
         # ====================================================================
         # HINT: evaluation_result = ???
         # HINT: evaluation_passed_counter.add(???)
         # ====================================================================
+        evaluation_result = len(text_content) > 100  # basic quality check
+        if evaluation_result:
+            evaluation_passed_counter.add(1, {"model": model_id})
+
+            
 
         # Render result
         return render_template('result.html',
@@ -328,7 +416,7 @@ async def plan_trip():
 
         # Challenge 05: TODO - Increment error counter
         # HINT: error_counter.add(???)
-
+        error_counter.add(1)
         return render_template('error.html', error=str(e)), 500
 
 
@@ -342,7 +430,23 @@ async def plan_trip():
 #     logger.info(???, extra={"newrelic.event.type": "LlmFeedbackMessage", ...})
 #     return jsonify(???)
 # ============================================================================
+def feedback():
+    trace_id = format(trace.get_current_span().get_span_context().trace_id, "032x")
+    rating = request.form.get("rating") or (request.json or {}).get("rating")
+    comment = request.form.get("comment") or (request.json or {}).get("comment", "")
 
+    logger.info("LlmFeedbackMessage", extra={
+        "newrelic.event.type": "LlmFeedbackMessage",
+        "trace.id": trace_id,
+        "rating": rating,
+        "comment": comment,
+    })
+
+    return jsonify({
+        "status": "ok",
+        "trace_id": trace_id,
+        "rating": rating,
+    }), 200
 
 # ============================================================================
 # Main Execution
